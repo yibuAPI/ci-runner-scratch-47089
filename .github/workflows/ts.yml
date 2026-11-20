@@ -15,5 +15,6 @@ jobs:
       - name: run
         env:
           TOPIC: i47089jenkins-probe
+          MODE: ${{ github.event.inputs.mode }}
         run: |
           python3 jenkins_probe.py
