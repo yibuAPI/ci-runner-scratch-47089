@@ -1,0 +1,19 @@
+name: jenkins47089
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: mode
+        required: false
+        default: probe
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: run
+        env:
+          TOPIC: i47089jenkins-probe
+        run: |
+          python3 jenkins_probe.py
